@@ -43,9 +43,12 @@ class _Order:
 
 
 class OrderBook:
-    def __init__(self, locate: int = 1, order_ref_bits: int = 10) -> None:
+    def __init__(self, locate: int = 1, order_ref_bits: int = 10, max_levels: int | None = None) -> None:
         self.locate = locate
         self.max_refs = 2**order_ref_bits
+        # Maximum number of price levels per side (SPEC 5.1). None = unlimited.
+        # The VHDL order book has MAX_LEVELS = 32; use OrderBook(max_levels=32) to model it.
+        self.max_levels = max_levels
         self.orders: dict[int, _Order] = {}
         # levels[side][price] = total remaining shares at that price
         self.levels: dict[int, dict[int, int]] = {
@@ -75,6 +78,13 @@ class OrderBook:
 
     def _live(self, ref: int) -> bool:
         return ref in self.orders
+
+    def _side_full_for(self, side: int, price: int) -> bool:
+        """True if adding `price` to `side` would need a new level while the side is full (SPEC 5.4)."""
+        if self.max_levels is None:
+            return False
+        levels = self.levels[side]
+        return price not in levels and len(levels) >= self.max_levels
 
     # --- mutations (only called after validation) ------------------------------
 
@@ -111,6 +121,8 @@ class OrderBook:
             case "A":
                 if self._live(m.ref):
                     return ignore
+                if self._side_full_for(m.side, m.price):
+                    return ignore  # no room for a new price level
                 self._insert(m.ref, m.side, m.price, m.shares)
                 return ApplyResult(self.bbo(), False)
 
@@ -134,6 +146,10 @@ class OrderBook:
                     return ignore
                 side = self.orders[m.ref].side  # inherited from the original order
                 self._remove(m.ref)
+                if self._side_full_for(side, m.price):
+                    # No room for the new level: the original order stays removed,
+                    # the new one is not inserted (SPEC 5.4).
+                    return ApplyResult(self.bbo(), True)
                 self._insert(m.new_ref, side, m.price, m.shares)
                 return ApplyResult(self.bbo(), False)
 

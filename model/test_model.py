@@ -176,3 +176,38 @@ def test_random_stream_is_consistent(seed):
     for r in results:
         if r.bbo and r.bbo.bid_valid and r.bbo.ask_valid:
             assert r.bbo.bid_price < r.bbo.ask_price, "book should never be crossed"
+
+
+def test_level_overflow():
+    book = OrderBook(max_levels=2)
+    _, results, _ = run(
+        [
+            AddOrder(1, SIDE_BUY, 10, 1_000_000),
+            AddOrder(2, SIDE_BUY, 10, 999_900),
+            AddOrder(3, SIDE_BUY, 10, 999_800),  # third level: no room
+            AddOrder(4, SIDE_BUY, 10, 1_000_000),  # existing level: fine
+            AddOrder(5, SIDE_SELL, 10, 1_000_100),  # other side: fine
+        ],
+        book,
+    )
+    assert [r.err for r in results] == [False, False, True, False, False]
+    assert results[2].bbo is None
+    assert results[3].bbo.bid_qty == 20
+
+
+def test_replace_into_full_side_removes_original():
+    book = OrderBook(max_levels=2)
+    _, results, _ = run(
+        [
+            AddOrder(1, SIDE_BUY, 10, 1_000_000),
+            AddOrder(2, SIDE_BUY, 10, 1_000_000),
+            AddOrder(3, SIDE_BUY, 10, 999_900),
+            OrderReplace(2, 4, 5, 999_800),  # level 1_000_000 keeps order 1: no room
+        ],
+        book,
+    )
+    last = results[-1]
+    assert last.err and last.bbo is not None
+    assert (last.bbo.bid_price, last.bbo.bid_qty) == (1_000_000, 10)
+    assert 2 not in book.orders and 4 not in book.orders
+    book.check_invariants()
