@@ -6,3 +6,9 @@ results.xml
 *.ghw
 *.fst
 .pytest_cache/
+# Vivado
+vivado/out/
+.Xil/
+*.jou
+*.log
+*.str
