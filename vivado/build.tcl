@@ -41,7 +41,9 @@ report_utilization    -file [file join $out utilization_synth.rpt]
 report_timing_summary -file [file join $out timing_synth.rpt]
 
 # --- implementation ------------------------------------------------------------
-opt_design
+# All default optimizations except BRAM power optimization, which crashed
+# Vivado 2024.2 on this design (EXCEPTION_ACCESS_VIOLATION in pwropt).
+opt_design -retarget -propconst -sweep -bufg_opt -shift_register_opt
 place_design
 phys_opt_design
 route_design

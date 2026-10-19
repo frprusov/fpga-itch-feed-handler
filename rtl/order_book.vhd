@@ -24,6 +24,12 @@
 --                                                 the next best level becomes entry 0
 --                  All of this happens in a single clock cycle.
 --
+--                  Each cycle performs at most ONE level operation (add or sub) on
+--                  one side. The state machine only decides which one; the level
+--                  logic (comparators, shifters) exists once per side. Calling the
+--                  level functions from every branch would duplicate that logic for
+--                  every call site, which made the first version use ~60% of the LUTs.
+--
 -- Message handling and latency (rising edges from in_valid to bbo_valid):
 --   A        1 cycle   checked against `live` (flip-flops), no table read needed
 --   E, X, D  2 cycles  cycle 1: read the table, cycle 2: update order and level
@@ -110,12 +116,6 @@ architecture rtl of order_book is
     return r;
   end function;
 
-  -- True if adding price p needs a new level while the side is already full.
-  function full_for(s : book_side_t; p : unsigned(31 downto 0)) return boolean is
-  begin
-    return s.count = MAX_LEVELS and find_level(s, p) = MAX_LEVELS;
-  end function;
-
   -- Is price a better than price b? Bids: higher is better. Asks: lower is better.
   function better(is_bid : boolean; a, b : unsigned(31 downto 0)) return boolean is
   begin
@@ -126,14 +126,13 @@ architecture rtl of order_book is
     end if;
   end function;
 
-  -- Add q shares at price p. Caller has checked that the side is not full_for(p).
-  function level_add(s : book_side_t; is_bid : boolean;
+  -- Add q shares at price p. m = find_level(s, p), computed once by the caller.
+  -- Caller has checked that a new level fits (side not full, or price exists).
+  function level_add(s : book_side_t; is_bid : boolean; m : natural;
                      p, q : unsigned(31 downto 0)) return book_side_t is
     variable r : book_side_t := s;
-    variable m : natural range 0 to MAX_LEVELS;
     variable k : natural range 0 to MAX_LEVELS;
   begin
-    m := find_level(s, p);
     if m /= MAX_LEVELS then                    -- price exists: add to its quantity
       r.lv(m).qty := s.lv(m).qty + q;
       return r;
@@ -160,12 +159,10 @@ architecture rtl of order_book is
     return r;
   end function;
 
-  -- Remove q shares at price p. A level that reaches 0 is deleted.
-  function level_sub(s : book_side_t; p, q : unsigned(31 downto 0)) return book_side_t is
+  -- Remove q shares from level m (= find_level(s, price)). A level that reaches 0 is deleted.
+  function level_sub(s : book_side_t; m : natural; q : unsigned(31 downto 0)) return book_side_t is
     variable r : book_side_t := s;
-    variable m : natural range 0 to MAX_LEVELS;
   begin
-    m := find_level(s, p);
     if m = MAX_LEVELS then                     -- not found: cannot happen for a live order
       return r;
     end if;
@@ -199,6 +196,7 @@ architecture rtl of order_book is
   -- Control and book state
   ---------------------------------------------------------------------------
   type state_t is (S_IDLE, S_LOOKUP, S_U_INSERT);
+  type op_t is (OP_NONE, OP_ADD, OP_SUB);   -- level operation requested this cycle
   signal state : state_t := S_IDLE;
 
   signal live : std_logic_vector(0 to N_REFS-1) := (others => '0');
@@ -250,6 +248,14 @@ begin
     variable bids_v   : book_side_t;
     variable asks_v   : book_side_t;
     variable emit     : boolean;                 -- pulse bbo_valid this cycle
+    -- The one level operation of this cycle
+    variable op_kind  : op_t;
+    variable op_bid   : boolean;                 -- true: bids, false: asks
+    variable op_price : unsigned(31 downto 0);
+    variable op_qty   : unsigned(31 downto 0);
+    variable mb, ma   : natural range 0 to MAX_LEVELS;  -- index of op_price in bids / asks
+    variable full_b   : boolean;                 -- op_price would need a 33rd bid level
+    variable full_a   : boolean;                 -- same for asks
     variable is_bid   : boolean;
     variable ref_i    : natural range 0 to N_REFS-1;
     variable new_i    : natural range 0 to N_REFS-1;
@@ -280,9 +286,26 @@ begin
 
       else
         -- Work on copies; written back to the registers at the end of the process.
-        bids_v := bids;
-        asks_v := asks;
-        emit   := false;
+        bids_v  := bids;
+        asks_v  := asks;
+        emit    := false;
+        op_kind := OP_NONE;
+        op_bid  := true;
+        op_qty  := (others => '0');
+
+        -- Phase 1: the price this cycle's level operation (if any) works on.
+        -- Look it up once per side; the result serves the full check AND the update.
+        case state is
+          when S_IDLE     => op_price := unsigned(in_price);                -- A
+          when S_LOOKUP   => op_price := unsigned(tbl_rdata(63 downto 32)); -- E/X/D/U: stored price
+          when S_U_INSERT => op_price := m_price;                           -- new price of a U
+        end case;
+        mb     := find_level(bids, op_price);
+        ma     := find_level(asks, op_price);
+        full_b := bids.count = MAX_LEVELS and mb = MAX_LEVELS;
+        full_a := asks.count = MAX_LEVELS and ma = MAX_LEVELS;
+
+        -- Phase 2: the state machine decides what happens.
 
         case state is
 
@@ -314,20 +337,17 @@ begin
               elsif in_type = MSG_ADD then
                 if live(ref_i) = '1' then
                   err_r <= '1';                               -- ref already live
-                elsif (is_bid and full_for(bids, unsigned(in_price))) or
-                      (not is_bid and full_for(asks, unsigned(in_price))) then
+                elsif (is_bid and full_b) or (not is_bid and full_a) then
                   err_r <= '1';                               -- no room for a new level
                 else
                   live(ref_i) <= '1';
                   tbl_we    <= '1';
                   tbl_waddr <= unsigned(in_ref(RB-1 downto 0));
                   tbl_wdata <= in_side & in_price & in_shares;
-                  if is_bid then
-                    bids_v := level_add(bids_v, true, unsigned(in_price), unsigned(in_shares));
-                  else
-                    asks_v := level_add(asks_v, false, unsigned(in_price), unsigned(in_shares));
-                  end if;
-                  emit := true;
+                  op_kind   := OP_ADD;
+                  op_bid    := is_bid;
+                  op_qty    := unsigned(in_shares);
+                  emit      := true;
                 end if;
 
               elsif in_type = MSG_EXECUTED or in_type = MSG_CANCEL or
@@ -367,32 +387,26 @@ begin
                 tbl_waddr <= m_ref;
                 tbl_wdata <= o_side & std_logic_vector(o_price) & std_logic_vector(left_v);
               end if;
-              if is_bid then
-                bids_v := level_sub(bids_v, o_price, amt);
-              else
-                asks_v := level_sub(asks_v, o_price, amt);
-              end if;
-              emit := true;
+              op_kind := OP_SUB;
+              op_bid  := is_bid;
+              op_qty  := amt;
+              emit    := true;
 
             elsif m_type = MSG_DELETE then
               live(ref_i) <= '0';
-              if is_bid then
-                bids_v := level_sub(bids_v, o_price, o_shares);
-              else
-                asks_v := level_sub(asks_v, o_price, o_shares);
-              end if;
-              emit := true;
+              op_kind := OP_SUB;
+              op_bid  := is_bid;
+              op_qty  := o_shares;
+              emit    := true;
 
             elsif m_type = MSG_REPLACE then
               if m_new_ref_ok = '0' or (m_new_ref /= m_ref and live(new_i) = '1') then
                 err_r <= '1';                                 -- invalid new ref: book unchanged
               else
                 live(ref_i) <= '0';                           -- remove the original order
-                if is_bid then
-                  bids_v := level_sub(bids_v, o_price, o_shares);
-                else
-                  asks_v := level_sub(asks_v, o_price, o_shares);
-                end if;
+                op_kind := OP_SUB;
+                op_bid  := is_bid;
+                op_qty  := o_shares;
                 u_side <= o_side;                             -- new order inherits the side
                 state  <= S_U_INSERT;
               end if;
@@ -406,23 +420,35 @@ begin
             new_i  := to_integer(m_new_ref);
             is_bid := u_side = '0';
 
-            if (is_bid and full_for(bids, m_price)) or
-               (not is_bid and full_for(asks, m_price)) then
+            if (is_bid and full_b) or (not is_bid and full_a) then
               err_r <= '1';                                   -- no room: original stays removed
             else
               live(new_i) <= '1';
               tbl_we    <= '1';
               tbl_waddr <= m_new_ref;
               tbl_wdata <= u_side & std_logic_vector(m_price) & std_logic_vector(m_shares);
-              if is_bid then
-                bids_v := level_add(bids_v, true, m_price, m_shares);
-              else
-                asks_v := level_add(asks_v, false, m_price, m_shares);
-              end if;
+              op_kind   := OP_ADD;
+              op_bid    := is_bid;
+              op_qty    := m_shares;
             end if;
             emit := true;
 
         end case;
+
+        -- Phase 3: apply the one level operation. One adder/shifter per side.
+        if op_kind = OP_ADD then
+          if op_bid then
+            bids_v := level_add(bids, true, mb, op_price, op_qty);
+          else
+            asks_v := level_add(asks, false, ma, op_price, op_qty);
+          end if;
+        elsif op_kind = OP_SUB then
+          if op_bid then
+            bids_v := level_sub(bids, mb, op_qty);
+          else
+            asks_v := level_sub(asks, ma, op_qty);
+          end if;
+        end if;
 
         -- Write back the book and publish the top of book.
         bids <= bids_v;
