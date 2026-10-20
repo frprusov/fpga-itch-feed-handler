@@ -36,6 +36,7 @@ from model.scenarios import ADD_ORDER_EXAMPLE, SCENARIO_7_2, SCENARIO_7_2_EXPECT
 from model.stream_gen import random_stream
 
 MAX_LEVELS = 32  # must match the generic of feed_handler.vhd
+CLOCK_NS = 8.656  # post-route clock period of order book v5 (SPEC 6), only used in the log
 
 # End-to-end latency limit per message type (rising edges from the edge that
 # consumes the last byte to the edge that sets bbo_valid). Parser 0 + book.
@@ -226,5 +227,5 @@ async def test_latency(dut):
         lat = latencies[t]
         dut._log.info(
             f"{t}: {max(lat)} cycle(s) from last byte to bbo_valid "
-            f"(worst of {len(lat)}; = {max(lat) * 5} ns at 200 MHz)"
+            f"(worst of {len(lat)}; = {max(lat) * CLOCK_NS:.1f} ns at {1000 / CLOCK_NS:.1f} MHz)"
         )

@@ -1,7 +1,7 @@
 # SPEC — FPGA ITCH Feed Handler
 
-Version: v1 (8-bit datapath)
-Status: draft, defines the behaviour that the Python reference model and the VHDL implementation must both satisfy.
+Version: v1 (8-bit datapath), order book v5
+Status: implemented. This document defines the behaviour that the Python reference model and the VHDL implementation must both satisfy; the testbenches check the VHDL against the model.
 
 ---
 
@@ -206,7 +206,7 @@ After every message that is applied to the book, `bbo_valid` is asserted for exa
 | `err_ref` | 1 | Pulse on invalid input (section 5.4) |
 | `busy` | 1 | `1` while a message is being processed; `in_valid` must only be asserted when `busy = 0` |
 
-The order book needs at most 4 cycles per message. The parser delivers at most one message every 21 cycles (shortest framed message), so `busy` never blocks the stream.
+The order book is busy for at most 7 cycles per message. The parser delivers at most one message every 21 cycles (shortest framed message), so `busy` never blocks the stream.
 
 `bbo_valid` is asserted for every applied message, including messages that do not change the top of book. This keeps the comparison with the reference model one-to-one.
 
@@ -214,16 +214,19 @@ The order book needs at most 4 cycles per message. The parser delivers at most o
 
 ## 6. Latency and timing
 
-All latencies are measured in clock cycles in simulation and converted to nanoseconds using the post-route clock period reported by Vivado.
+Latencies are measured in clock cycles in simulation (cocotb, worst case over a random stream of 2000 messages) and converted to nanoseconds using the post-route clock period reported by Vivado.
 
-| Metric | Definition | Target |
+| Metric | Definition | Measured |
 |---|---|---|
-| Parser latency | Rising edges from the edge that consumes the **last byte** of a message to the edge that sets `msg_valid` | 0 cycles (measured: 0, same edge) |
-| Order book latency | Rising edges from the edge that sees `msg_valid` (`in_valid`) to the edge that sets `bbo_valid` | measured: `A` 1, `E`/`X`/`D` 2, `U` 3 cycles |
-| End-to-end latency | Parser latency + order book latency | measured |
-| Clock frequency | Post-route timing on `xc7z020clg400-1` (PYNQ-Z2) | ≥ 200 MHz |
+| Parser latency | Rising edges from the edge that consumes the **last byte** of a message to the edge that sets `msg_valid` | 0 cycles (same edge) |
+| Order book latency | Rising edges from the edge that sees `in_valid` to the edge that sets `bbo_valid` | `A` 3, `E`/`X`/`D` 4, `U` 6 cycles |
+| End-to-end latency | Parser + order book | `A` 3, `E`/`X`/`D` 4, `U` 6 cycles |
+| Clock frequency | Post-route, out of context, `xc7z020clg400-1` (PYNQ-Z2), Vivado 2024.1, default effort | **115.5 MHz** (8.656 ns) |
+| End-to-end latency in ns | cycles × 8.656 ns | `A` 26.0 ns, `E`/`X`/`D` 34.6 ns, `U` 51.9 ns |
 
-The reported latency is the worst case over all message types, and the distribution over a randomized test stream.
+Resources (out of context): 17 642 LUTs (33 %), 7 018 flip-flops (7 %), 2 RAMB36 (1 %).
+
+The original target was ≥ 200 MHz. It was not reached: comparing a price with 32 levels per side, deciding, and updating a sorted level array is a lot of logic per cycle on a 7-series `-1` device, and 70–80 % of the critical path is routing. The figure that matters is the **latency in nanoseconds**, not Fmax on its own: pipelining raised Fmax from 51 to 81 MHz but made the latency worse (see the version table in the README). A real 10G design runs at the MAC clock of 156.25 MHz (6.4 ns); reaching that is on the roadmap (section 9).
 
 ---
 
@@ -277,4 +280,5 @@ The Python reference model and the VHDL implementation must both reproduce this 
 ## 9. Roadmap
 
 - **v1**: 8-bit AXI-Stream input, one byte per cycle.
+- **Order book at 156.25 MHz** (the 10G MAC clock): fewer price levels in registers (only the top N matter for the top of book), deeper levels in BRAM, and overlapping consecutive messages in the pipeline.
 - **v2**: 64-bit AXI-Stream input (8 bytes per cycle, as delivered by a 10G Ethernet MAC at 156.25 MHz), with messages starting at arbitrary byte offsets within a word. Goal: reduce parser latency per message.
