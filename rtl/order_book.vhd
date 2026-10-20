@@ -1,4 +1,4 @@
--- order_book.vhd  (v4)
+-- order_book.vhd  (v5)
 -- Limit order book for one instrument (SPEC.md section 5).
 --
 -- Input : the decoded messages from itch_parser (one in_valid pulse per message).
@@ -21,13 +21,18 @@
 --       no BRAM output register                                 96 MHz
 --       critical paths: compare -> select level qty -> subtract (in series), and
 --       live (1024:1 mux) -> decision in S_DECIDE -> 84 register enables
---   v4  this version, same cycle counts as v3:
+--   v4  same cycle counts as v3:                              104 MHz
 --       * `live` of the message's refs is looked up in S_IDLE and registered;
 --         S_DECIDE and S_APPLY read one flip-flop instead of a 1024:1 mux.
 --         The duplicate check of an A also moves to S_APPLY.
 --       * S_FIND compares the operation's quantity with EVERY level in parallel
---         with the price compare, instead of after it; the new level quantity
---         (add/subtract) is computed in S_APPLY from the registered level quantity.
+--         with the price compare, instead of after it.
+--       critical path: price compare -> match -> 32:1 mux selecting the quantity
+--       of the matching level
+--   v5  this version, same cycle counts: no quantity mux at all. S_FIND computes
+--       qty(i) +/- op_qty for EVERY level of the operation's side in parallel
+--       (32 adders) and registers all 32 results; S_APPLY gives the matching
+--       level its own precomputed value. Costs ~1k LUTs and 1k flip-flops.
 --
 --   S_IDLE    latch the message and the `live` bits of its refs; checks that need
 --             no table (locate, ref range)
@@ -39,7 +44,7 @@
 --
 -- Latency (rising edges from in_valid to bbo_valid):
 --   A 3 (IDLE, FIND, APPLY)   E/X/D 4   U 6 (remove old, then FIND+APPLY for the new)
--- (the same in v3 and v4)
+-- (the same in v3, v4 and v5)
 --
 -- The book is busy at most 7 cycles per message. The parser delivers at most one
 -- message every 21 cycles (shortest message), so in_valid never arrives while the
@@ -113,6 +118,9 @@ architecture rtl of order_book is
 
   type op_t is (OP_NONE, OP_ADD, OP_SUB);
 
+  -- One quantity per level (the precomputed new quantities of S_FIND).
+  type qty_arr_t is array (0 to MAX_LEVELS-1) of unsigned(31 downto 0);
+
   -- Bit i = '1' if level i is in use and has price p (at most one bit set).
   function match_vec(s : book_side_t; p : unsigned(31 downto 0)) return lvl_vec_t is
     variable v : lvl_vec_t := (others => '0');
@@ -170,33 +178,36 @@ architecture rtl of order_book is
     return v /= (v'range => '0');
   end function;
 
-  -- Quantity of the matching level (0 if none): an AND-OR tree, no index decoding.
-  function match_qty(s : book_side_t; m : lvl_vec_t) return unsigned is
-    variable q : unsigned(31 downto 0) := (others => '0');
+  -- New quantity of EVERY level if the operation hit it: qty(i) + q or qty(i) - q.
+  -- 32 adders side by side; S_APPLY keeps only the one of the matching level.
+  function new_qty_vec(s : book_side_t; op : op_t; q : unsigned(31 downto 0)) return qty_arr_t is
+    variable r : qty_arr_t;
   begin
     for i in 0 to MAX_LEVELS-1 loop
-      if m(i) = '1' then
-        q := q or s.lv(i).qty;
+      if op = OP_ADD then
+        r(i) := s.lv(i).qty + q;
+      else
+        r(i) := s.lv(i).qty - q;
       end if;
     end loop;
-    return q;
+    return r;
   end function;
 
   -- Apply one level operation. All decisions were made in S_FIND and come in as
   -- registered bit vectors, so this is only a small multiplexer per register bit.
-  --   ADD, found     : level with match = '1' gets quantity newq
+  --   ADD, found     : level with match = '1' gets its precomputed quantity nq(i)
   --   ADD, not found : insert (p, q) after the levels that are better
-  --   SUB, not rm    : level with match = '1' gets quantity newq
+  --   SUB, not rm    : level with match = '1' gets its precomputed quantity nq(i)
   --   SUB, rm        : remove the matching level, worse levels move up
   function level_apply(s : book_side_t; op : op_t; found, rm : boolean;
                        m, b, geq : lvl_vec_t;
-                       p, q, newq : unsigned(31 downto 0)) return book_side_t is
+                       p, q : unsigned(31 downto 0); nq : qty_arr_t) return book_side_t is
     variable r : book_side_t := s;
   begin
     if (op = OP_ADD and found) or (op = OP_SUB and not rm) then
       for i in 0 to MAX_LEVELS-1 loop
         if m(i) = '1' then
-          r.lv(i).qty := newq;
+          r.lv(i).qty := nq(i);
         end if;
       end loop;
 
@@ -277,7 +288,7 @@ architecture rtl of order_book is
   signal f_found : boolean := false;
   signal f_full  : boolean := false;             -- ADD would need a level on a full side
   signal f_rm    : boolean := false;             -- SUB empties the level
-  signal f_qm    : unsigned(31 downto 0) := (others => '0');  -- quantity of the matching level
+  signal f_nq    : qty_arr_t := (others => (others => '0'));  -- new qty per level
 
   -- Output registers
   signal bbo_r       : std_logic := '0';
@@ -320,16 +331,14 @@ begin
     variable mb, ma   : lvl_vec_t;               -- match vectors
     variable bb, ba   : lvl_vec_t;               -- better vectors
     variable gb, ga   : lvl_vec_t;               -- level qty > op_qty
-    variable qb, qa   : unsigned(31 downto 0);   -- quantity of the matching level
     variable mv, bv   : lvl_vec_t;
     variable gv       : lvl_vec_t;
-    variable qm       : unsigned(31 downto 0);
+    variable sv       : book_side_t;             -- the operation's side
     variable cnt_full : boolean;                 -- the operation's side has MAX_LEVELS levels
     -- S_APPLY
     variable bids_v   : book_side_t;
     variable asks_v   : book_side_t;
     variable emit     : boolean;                 -- pulse bbo_valid this cycle
-    variable newq     : unsigned(31 downto 0);   -- new quantity of the matching level
   begin
     if rising_edge(clk) then
 
@@ -468,12 +477,10 @@ begin
             ba := better_vec(asks, false, op_price);
             gb := gt_vec(bids, op_qty);                       -- in parallel with the price
             ga := gt_vec(asks, op_qty);                       -- compare, not after it
-            qb := match_qty(bids, mb);
-            qa := match_qty(asks, ma);
             if op_side = '0' then
-              mv := mb;  bv := bb;  gv := gb;  qm := qb;  cnt_full := bids.count = MAX_LEVELS;
+              mv := mb;  bv := bb;  gv := gb;  sv := bids;  cnt_full := bids.count = MAX_LEVELS;
             else
-              mv := ma;  bv := ba;  gv := ga;  qm := qa;  cnt_full := asks.count = MAX_LEVELS;
+              mv := ma;  bv := ba;  gv := ga;  sv := asks;  cnt_full := asks.count = MAX_LEVELS;
             end if;
 
             f_match  <= mv;
@@ -481,7 +488,9 @@ begin
             f_geq    <= prefix_or(mv);
             f_found  <= any(mv);
             f_full   <= cnt_full and not any(mv);
-            f_qm <= qm;
+            -- op_side, op_kind and the levels are all registers, so this path is
+            -- side select -> adder -> register, independent of the price compare.
+            f_nq <= new_qty_vec(sv, op_kind, op_qty);
             f_rm <= op_kind = OP_SUB and not any(mv and gv);  -- matching level not > op_qty
 
             publish <= not u_first;                         -- first half of a U: no output
@@ -492,11 +501,6 @@ begin
           when S_APPLY =>
             bids_v := bids;
             asks_v := asks;
-            if op_kind = OP_ADD then
-              newq := f_qm + op_qty;
-            else
-              newq := f_qm - op_qty;
-            end if;
 
             if op_kind = OP_ADD and u_second = '0' and ref_live = '1' then
               -- A for a ref that is already live (SPEC 5.4): rejected, no output.
@@ -522,10 +526,10 @@ begin
               end if;
               if op_side = '0' then
                 bids_v := level_apply(bids, op_kind, f_found, f_rm, f_match, f_better, f_geq,
-                                      op_price, op_qty, newq);
+                                      op_price, op_qty, f_nq);
               else
                 asks_v := level_apply(asks, op_kind, f_found, f_rm, f_match, f_better, f_geq,
-                                      op_price, op_qty, newq);
+                                      op_price, op_qty, f_nq);
               end if;
             end if;
             bids <= bids_v;
