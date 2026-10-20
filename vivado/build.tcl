@@ -28,12 +28,12 @@ set THREADS  8
 # The reported Fmax is computed from the slack, so it is meaningful whatever the
 # target: a design that reaches 130 MHz reports ~130 MHz with a 10 ns target too.
 # A far-too-tight target makes synthesis spend a very long time on timing.
-set CLOCK_NS 10.0
+set CLOCK_NS 9.0
 
 # 1 = fast run: runtime-optimized directives, no phys_opt_design. Good for a first
 #     measurement; Fmax can come out a little lower than the best possible.
 # 0 = default effort.
-set FAST     1
+set FAST     0
 
 # =============================================================================
 
