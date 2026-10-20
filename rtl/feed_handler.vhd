@@ -8,7 +8,7 @@
 --
 -- End-to-end latency, from the clock edge that consumes the last byte of a
 -- message to the edge that sets bbo_valid:
---   parser 0 cycles + order book (A 1, E/X/D 2, U 3) = A 1, E/X/D 2, U 3 cycles.
+--   parser 0 cycles + order book (A 3, E/X/D 5, U 7) = A 3, E/X/D 5, U 7 cycles.
 
 library ieee;
 use ieee.std_logic_1164.all;
@@ -101,7 +101,7 @@ begin
     );
 
   -- Simulation-only check (ignored by synthesis): the parser delivers at most one
-  -- message every 21 cycles and the book needs at most 4, so this must never fire.
+  -- message every 21 cycles and the book needs at most 8, so this must never fire.
   -- synthesis translate_off
   process (clk)
   begin
