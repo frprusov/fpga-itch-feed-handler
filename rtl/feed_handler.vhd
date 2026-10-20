@@ -8,7 +8,7 @@
 --
 -- End-to-end latency, from the clock edge that consumes the last byte of a
 -- message to the edge that sets bbo_valid:
---   parser 0 cycles + order book (A 3, E/X/D 5, U 7) = A 3, E/X/D 5, U 7 cycles.
+--   parser 0 cycles + order book (A 3, E/X/D 4, U 6) = A 3, E/X/D 4, U 6 cycles.
 
 library ieee;
 use ieee.std_logic_1164.all;

@@ -1,4 +1,4 @@
--- order_book.vhd  (v2, pipelined)
+-- order_book.vhd  (v3)
 -- Limit order book for one instrument (SPEC.md section 5).
 --
 -- Input : the decoded messages from itch_parser (one in_valid pulse per message).
@@ -9,29 +9,33 @@
 --   live        1024 flip-flops, one per order reference: is this order live?
 --               Flip-flops (not BRAM) so that a reset clears every order at once.
 --   table       BRAM, 1024 x 65 bits: side & price & remaining shares per order ref.
---               Read with the BRAM output register: data arrives 2 cycles after the
---               address (S_READ, then S_DECIDE).
+--               Read takes 1 cycle: the entry is in tbl_rdata in S_DECIDE.
 --   bids, asks  Price levels per side, SORTED in registers, best level at index 0,
 --               so the top of book is always entry 0.
 --
--- v1 did a whole message in 1-3 long cycles and reached ~51 MHz: one path went
--- BRAM -> price compare -> insert position -> shift all levels -> top of book.
--- v2 cuts that path into short stages, each ending in registers:
+-- Version history (measured out of context on xc7z020-1, see README):
+--   v1  whole message in 1-3 long cycles                       51 MHz
+--   v2  pipelined: BRAM output reg, separate FIND/APPLY         81 MHz, but 2.5x cycles
+--       critical path: side select (fanout 2048) -> compare -> full -> live write
+--   v3  this version:
+--       * comparators for BOTH sides work in parallel; the side is selected on the
+--         32-bit result vectors, not on the 2048-bit level arrays
+--       * every write to `live` and the table is driven by a registered decision,
+--         never directly by a comparator result
+--       * no BRAM output register: S_DECIDE reads tbl_rdata (saves a cycle)
 --
 --   S_IDLE    latch the message; checks that need no table (locate, ref range,
 --             duplicate A via `live`)
---   S_READ    wait for the BRAM output register                    (E/X/D/U)
---   S_DECIDE  stored order is available: validate, compute the level operation
---   S_FIND    compare the operation's price with all levels of its side in
---             parallel; register the results as bit vectors (match, better, ...)
---             and the new quantity
---   S_APPLY   update the levels using only those registered vectors (shallow
---             muxes) and publish the new top of book directly from entry 0
+--   S_DECIDE  stored order is in tbl_rdata: validate, compute the level operation
+--   S_FIND    compare the operation's price with all levels of both sides;
+--             register the results as bit vectors (match, better, ...)
+--   S_APPLY   act on the registered results: write `live`/table, update the
+--             levels (shallow muxes) and publish the top of book from entry 0
 --
 -- Latency (rising edges from in_valid to bbo_valid):
---   A 3 (IDLE, FIND, APPLY)   E/X/D 5   U 7 (remove old, then FIND+APPLY for the new)
+--   A 3 (IDLE, FIND, APPLY)   E/X/D 4   U 6 (remove old, then FIND+APPLY for the new)
 --
--- The book is busy at most 8 cycles per message. The parser delivers at most one
+-- The book is busy at most 7 cycles per message. The parser delivers at most one
 -- message every 21 cycles (shortest message), so in_valid never arrives while the
 -- book is busy. `busy` is an output so the testbench can check that.
 
@@ -214,7 +218,6 @@ architecture rtl of order_book is
   signal table     : table_t;
   signal tbl_raddr : unsigned(RB-1 downto 0);
   signal tbl_rdata : std_logic_vector(64 downto 0);
-  signal tbl_q     : std_logic_vector(64 downto 0);   -- BRAM output register
   signal tbl_we    : std_logic := '0';
   signal tbl_waddr : unsigned(RB-1 downto 0) := (others => '0');
   signal tbl_wdata : std_logic_vector(64 downto 0) := (others => '0');
@@ -222,7 +225,7 @@ architecture rtl of order_book is
   ---------------------------------------------------------------------------
   -- Control and book state
   ---------------------------------------------------------------------------
-  type state_t is (S_IDLE, S_READ, S_DECIDE, S_FIND, S_APPLY);
+  type state_t is (S_IDLE, S_DECIDE, S_FIND, S_APPLY);
   signal state : state_t := S_IDLE;
 
   signal live : std_logic_vector(0 to N_REFS-1) := (others => '0');
@@ -245,12 +248,14 @@ architecture rtl of order_book is
   signal u_first  : std_logic := '0';            -- current SUB is the first half of a U
   signal u_second : std_logic := '0';            -- current ADD is the second half of a U
   signal publish  : std_logic := '0';            -- S_APPLY must pulse bbo_valid
+  signal clr_live : std_logic := '0';            -- S_FIND clears live(m_ref)
 
   -- Results of S_FIND, used by S_APPLY
   signal f_match : lvl_vec_t := (others => '0');
   signal f_better: lvl_vec_t := (others => '0');
   signal f_geq   : lvl_vec_t := (others => '0');
   signal f_found : boolean := false;
+  signal f_full  : boolean := false;             -- ADD would need a level on a full side
   signal f_rm    : boolean := false;
   signal f_newq  : unsigned(31 downto 0) := (others => '0');
 
@@ -267,9 +272,9 @@ architecture rtl of order_book is
 begin
 
   ---------------------------------------------------------------------------
-  -- Order table: synchronous read + output register (2 cycles), one write port.
+  -- Order table: synchronous read (1 cycle), one write port.
   -- The read address is always the incoming ref: the entry of a new message is
-  -- in tbl_q two cycles after in_valid (state S_DECIDE).
+  -- in tbl_rdata one cycle after in_valid (state S_DECIDE).
   ---------------------------------------------------------------------------
   tbl_raddr <= unsigned(in_ref(RB-1 downto 0));
 
@@ -280,7 +285,6 @@ begin
         table(to_integer(tbl_waddr)) <= tbl_wdata;
       end if;
       tbl_rdata <= table(to_integer(tbl_raddr));
-      tbl_q     <= tbl_rdata;
     end if;
   end process;
 
@@ -294,14 +298,17 @@ begin
     variable o_price  : unsigned(31 downto 0);
     variable o_shares : unsigned(31 downto 0);
     variable diff     : unsigned(31 downto 0);
-    -- S_FIND
-    variable sel      : book_side_t;
-    variable mv       : lvl_vec_t;
+    -- S_FIND: results for both sides, then the operation's side is selected
+    variable mb, ma   : lvl_vec_t;               -- match vectors
+    variable bb, ba   : lvl_vec_t;               -- better vectors
+    variable qb, qa   : unsigned(31 downto 0);   -- quantity of the matching level
+    variable mv, bv   : lvl_vec_t;
     variable qm       : unsigned(31 downto 0);
-    variable full     : boolean;
+    variable cnt_full : boolean;                 -- the operation's side has MAX_LEVELS levels
     -- S_APPLY
     variable bids_v   : book_side_t;
     variable asks_v   : book_side_t;
+    variable emit     : boolean;                 -- pulse bbo_valid this cycle
   begin
     if rising_edge(clk) then
 
@@ -319,6 +326,7 @@ begin
         u_first     <= '0';
         u_second    <= '0';
         publish     <= '0';
+        clr_live    <= '0';
         bid_valid_r <= '0';
         bid_price_r <= (others => '0');
         bid_qty_r   <= (others => '0');
@@ -365,24 +373,20 @@ begin
                 end if;
               elsif in_type = MSG_EXECUTED or in_type = MSG_CANCEL or
                     in_type = MSG_DELETE or in_type = MSG_REPLACE then
-                state <= S_READ;
+                state <= S_DECIDE;                            -- table entry arrives next cycle
               end if;
             end if;
 
           ---------------------------------------------------------------------
-          when S_READ =>
-            state <= S_DECIDE;                              -- BRAM output register
-
-          ---------------------------------------------------------------------
-          -- The stored order of m_ref is in tbl_q.
+          -- The stored order of m_ref is in tbl_rdata.
           ---------------------------------------------------------------------
           when S_DECIDE =>
             state    <= S_IDLE;
             ref_i    := to_integer(m_ref);
             new_i    := to_integer(m_new_ref);
-            o_side   := tbl_q(64);
-            o_price  := unsigned(tbl_q(63 downto 32));
-            o_shares := unsigned(tbl_q(31 downto 0));
+            o_side   := tbl_rdata(64);
+            o_price  := unsigned(tbl_rdata(63 downto 32));
+            o_shares := unsigned(tbl_rdata(31 downto 0));
 
             if live(ref_i) = '0' then
               err_r <= '1';                                   -- unknown order
@@ -394,7 +398,7 @@ begin
               op_price <= o_price;
               state    <= S_FIND;
               if m_shares >= o_shares then                    -- order fully gone
-                live(ref_i) <= '0';
+                clr_live    <= '1';
                 op_qty      <= o_shares;                      -- saturate (SPEC 5.4)
                 if m_shares > o_shares then
                   err_r <= '1';                               -- overfill
@@ -407,7 +411,7 @@ begin
               end if;
 
             elsif m_type = MSG_DELETE then
-              live(ref_i) <= '0';
+              clr_live <= '1';
               op_kind  <= OP_SUB;
               op_side  <= o_side;
               op_price <= o_price;
@@ -418,7 +422,7 @@ begin
               if m_new_ref_ok = '0' or (m_new_ref /= m_ref and live(new_i) = '1') then
                 err_r <= '1';                                 -- invalid new ref: book unchanged
               else
-                live(ref_i) <= '0';                           -- remove the original order
+                clr_live <= '1';                              -- remove the original order
                 op_kind  <= OP_SUB;
                 op_side  <= o_side;                           -- new order inherits this side
                 op_price <= o_price;
@@ -434,19 +438,29 @@ begin
           when S_FIND =>
             state <= S_APPLY;
 
-            if op_side = '0' then
-              sel := bids;
-            else
-              sel := asks;
+            if clr_live = '1' then                            -- decided in S_DECIDE
+              live(to_integer(m_ref)) <= '0';
+              clr_live <= '0';
             end if;
-            mv   := match_vec(sel, op_price);
-            qm   := match_qty(sel, mv);
-            full := sel.count = MAX_LEVELS and not any(mv);
+
+            -- Compare with both sides in parallel, select the result afterwards.
+            mb := match_vec(bids, op_price);
+            ma := match_vec(asks, op_price);
+            bb := better_vec(bids, true,  op_price);
+            ba := better_vec(asks, false, op_price);
+            qb := match_qty(bids, mb);
+            qa := match_qty(asks, ma);
+            if op_side = '0' then
+              mv := mb;  bv := bb;  qm := qb;  cnt_full := bids.count = MAX_LEVELS;
+            else
+              mv := ma;  bv := ba;  qm := qa;  cnt_full := asks.count = MAX_LEVELS;
+            end if;
 
             f_match  <= mv;
-            f_better <= better_vec(sel, op_side = '0', op_price);
+            f_better <= bv;
             f_geq    <= prefix_or(mv);
             f_found  <= any(mv);
+            f_full   <= cnt_full and not any(mv);
             if op_kind = OP_ADD then
               f_newq <= qm + op_qty;
               f_rm   <= false;
@@ -457,45 +471,43 @@ begin
 
             publish <= not u_first;                         -- first half of a U: no output
 
-            if op_kind = OP_ADD then
-              if full then
-                err_r <= '1';                                 -- no room for a new level
-                if u_second = '1' then
-                  op_kind <= OP_NONE;                         -- U: original stays removed,
-                  publish <= '1';                             -- still publish the book
-                else
-                  state <= S_IDLE;                            -- A: rejected, no output
-                end if;
-              elsif u_second = '1' then
-                live(to_integer(m_new_ref)) <= '1';
-                tbl_we    <= '1';
-                tbl_waddr <= m_new_ref;
-                tbl_wdata <= op_side & std_logic_vector(op_price) & std_logic_vector(op_qty);
-              else
-                live(to_integer(m_ref)) <= '1';
-                tbl_we    <= '1';
-                tbl_waddr <= m_ref;
-                tbl_wdata <= op_side & std_logic_vector(op_price) & std_logic_vector(op_qty);
-              end if;
-            end if;
-
           ---------------------------------------------------------------------
           -- Update the levels and publish the top of book.
           ---------------------------------------------------------------------
           when S_APPLY =>
             bids_v := bids;
             asks_v := asks;
-            if op_side = '0' then
-              bids_v := level_apply(bids, op_kind, f_found, f_rm, f_match, f_better, f_geq,
-                                    op_price, op_qty, f_newq);
+
+            if op_kind = OP_ADD and f_full then
+              -- No room for a new level (SPEC 5.4): do not insert.
+              -- A: rejected, no output.  U: original stays removed, book is published.
+              err_r <= '1';
+              emit  := publish = '1' and u_second = '1';
             else
-              asks_v := level_apply(asks, op_kind, f_found, f_rm, f_match, f_better, f_geq,
-                                    op_price, op_qty, f_newq);
+              emit := publish = '1';
+              if op_kind = OP_ADD then                        -- the new order becomes live
+                if u_second = '1' then
+                  live(to_integer(m_new_ref)) <= '1';
+                  tbl_waddr <= m_new_ref;
+                else
+                  live(to_integer(m_ref)) <= '1';
+                  tbl_waddr <= m_ref;
+                end if;
+                tbl_we    <= '1';
+                tbl_wdata <= op_side & std_logic_vector(op_price) & std_logic_vector(op_qty);
+              end if;
+              if op_side = '0' then
+                bids_v := level_apply(bids, op_kind, f_found, f_rm, f_match, f_better, f_geq,
+                                      op_price, op_qty, f_newq);
+              else
+                asks_v := level_apply(asks, op_kind, f_found, f_rm, f_match, f_better, f_geq,
+                                      op_price, op_qty, f_newq);
+              end if;
             end if;
             bids <= bids_v;
             asks <= asks_v;
 
-            if publish = '1' then
+            if emit then
               bbo_r <= '1';
               if bids_v.count > 0 then
                 bid_valid_r <= '1';

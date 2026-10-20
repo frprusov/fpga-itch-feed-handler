@@ -39,7 +39,7 @@ MAX_LEVELS = 32  # must match the generic of feed_handler.vhd
 
 # End-to-end latency limit per message type (rising edges from the edge that
 # consumes the last byte to the edge that sets bbo_valid). Parser 0 + book.
-LATENCY_LIMIT = {"A": 3, "E": 5, "X": 5, "D": 5, "U": 7}
+LATENCY_LIMIT = {"A": 3, "E": 4, "X": 4, "D": 4, "U": 6}
 
 
 # --- helpers -------------------------------------------------------------------

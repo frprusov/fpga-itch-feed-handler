@@ -43,7 +43,7 @@ MAX_LEVELS = 32  # must match the generic of order_book.vhd
 MAX_CYCLES = 20  # a message must be finished within this many cycles
 
 # Maximum latency per message type in cycles (rising edges from in_valid to bbo_valid).
-LATENCY_LIMIT = {"A": 3, "E": 5, "X": 5, "D": 5, "U": 7}
+LATENCY_LIMIT = {"A": 3, "E": 4, "X": 4, "D": 4, "U": 6}
 
 
 # --- helpers -------------------------------------------------------------------
